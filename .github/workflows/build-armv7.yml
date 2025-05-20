@@ -1,0 +1,67 @@
+name: Build ARMv7 OTA Provider
+
+on:
+  push:
+    tags:
+      - '2025.5.0*'   # 触发条件：任何以 2025.5.0 开头的 tag
+
+jobs:
+  build_armv7:
+    name: 编译并发布 ARMv7 二进制
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write  # 允许上传 Release 资产
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: 准备 Matter SDK
+        run: |
+          cd connectedhomeip
+          bash scripts/bootstrap.sh -p build,linux
+          scripts/run_in_build_env.sh "scripts/codepregen.py ./zzz_pregenerated/"
+        shell: bash
+
+      - name: 打包 Matter SDK
+        run: |
+          cd ..
+          tar -caf connectedhomeip.tar.zst --use-compress-program=zstdmt connectedhomeip
+
+      - name: 解压并编译 ARMv7
+        run: |
+          mkdir build && tar -xaf connectedhomeip.tar.zst -C build --use-compress-program=zstdmt
+          echo "开始在 ARMv7 环境中编译……"
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v "${{ github.workspace }}/build/connectedhomeip":/work/connectedhomeip \
+            -w /work/connectedhomeip \
+            ghcr.io/home-assistant-libs/chip-wheels/chip-wheels-builder:release \
+            bash -c "\
+              apt-get update && apt-get install -y zstd && \
+              bash scripts/bootstrap.sh -p all,linux && \
+              mkdir -p out && \
+              scripts/examples/gn_build_example.sh \
+                examples/ota-provider-app/linux/ \
+                out/ \
+                chip_project_config_include_dirs=[\"//../../../..\"] \
+                chip_crypto=\"boringssl\" \
+                chip_config_network_layer_ble=false \
+                chip_enable_wifi=false \
+                chip_enable_openthread=false \
+                chip_exchange_node_id_logging=true \
+                chip_mdns=\"minimal\" \
+                chip_minmdns_default_policy=\"libnl\" \
+                chip_use_data_model_interface=\"enabled\" && \
+              cp out/chip-ota-provider-app bin/chip-ota-provider-app-armv7 && \
+              strip bin/chip-ota-provider-app-armv7 \
+            "
+
+      - name: 上传 ARMv7 二进制到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: build/connectedhomeip/bin/chip-ota-provider-app-armv7
