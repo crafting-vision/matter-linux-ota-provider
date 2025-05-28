@@ -33,10 +33,7 @@ jobs:
             today="$(date --utc '+%Y-%m-%d')"
             midnight_timestamp="$(date --utc +%s --date=$today)"
             calver_date="$(date --utc --date=$today '+%Y.%-m.dev%-d')"
-            # Remove invalid chars
-            localversion="${version}"
-            localversion="${localversion//-/}"
-            localversion="${localversion//_/}"
+            localversion="${version//[-_]/}"
             version="${calver_date}+${localversion}"
           fi
           echo "Building version $version"
@@ -48,15 +45,13 @@ jobs:
         working-directory: ./connectedhomeip/
         run: |
           patches=(../*.patch)
-          if [ ! -e "${patches[0]}" ]
-          then
-              echo "No patches found"
-              exit 0
+          if [ ! -e "${patches[0]}" ]; then
+            echo "No patches found"
+            exit 0
           fi
-          for patch in "${patches[@]}"
-          do
-              echo "Applying ${patch}"
-              patch -p1 < $patch
+          for patch in "${patches[@]}"; do
+            echo "Applying ${patch}"
+            patch -p1 < "$patch"
           done
       - name: Bootstrap
         working-directory: ./connectedhomeip/
@@ -81,12 +76,9 @@ jobs:
     strategy:
       matrix:
         arch:
-          - name: x86-64
+          - name: armv7
             runner: ubuntu-22.04
-            example-prefix: linux-x64-
-          - name: aarch64
-            runner: linux-arm64
-            example-prefix: linux-arm64-
+            container: arm32v7/debian:12-slim
         include:
           - examples: >-
               ota-provider
@@ -94,18 +86,14 @@ jobs:
 
     runs-on: ${{ matrix.arch.runner }}
     permissions:
-      contents: write # for actions/upload-release-asset to upload release asset
+      contents: write
 
     defaults:
       run:
         working-directory: ./connectedhomeip/
 
     container:
-      image: ghcr.io/home-assistant-libs/chip-wheels/chip-wheels-builder:release
-      volumes:
-        - "/tmp/log_output:/tmp/test_logs"
-      options: --sysctl "net.ipv6.conf.all.disable_ipv6=0
-        net.ipv4.conf.all.forwarding=1 net.ipv6.conf.all.forwarding=1"
+      image: ${{ matrix.arch.container }}
 
     steps:
       - name: Restore Matter SDK from artifacts
@@ -113,12 +101,24 @@ jobs:
         with:
           name: matter-sdk-${{ github.run_id }}
       - name: Extract Matter SDK from tar
-        working-directory: ./
         run: |
-          apt update && apt install zstd
           rm -rf connectedhomeip/
           tar -xaf ./connectedhomeip.tar.zst --use-compress-program=zstdmt .
           git config --global --add safe.directory "*"
+      - name: Install dependencies and stub cipd
+        if: matrix.arch.name == 'armv7'
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ninja-build cmake python3-venv zstd git pkg-config \
+            libssl-dev libjson-c-dev libnl-3-dev libnl-route-3-dev
+          rm -rf /var/lib/apt/lists/*
+          mkdir -p .environment/cipd
+          cat > .environment/cipd/cipd << 'EOF'
+#!/bin/sh
+exit 0
+EOF
+          chmod +x .environment/cipd/cipd
       - name: Bootstrap
         run: bash scripts/bootstrap.sh -p all,linux
       - name: Setup and run build
@@ -127,41 +127,34 @@ jobs:
           ./scripts/examples/gn_build_example.sh \
               examples/ota-provider-app/linux/ \
               out/ \
-              chip_project_config_include_dirs=\[\"//../../../..\"\] \
-              chip_crypto=\"boringssl\" \
+              chip_project_config_include_dirs=["//../../../.."] \
+              chip_crypto="boringssl" \
               chip_config_network_layer_ble=false \
               chip_enable_wifi=false \
               chip_enable_openthread=false \
               chip_exchange_node_id_logging=true \
-              chip_mdns=\"minimal\" \
-              chip_minmdns_default_policy=\"libnl\" \
-              chip_use_data_model_interface=\"enabled\"
+              chip_mdns="minimal" \
+              chip_minmdns_default_policy="libnl" \
+              chip_use_data_model_interface="enabled"
           cp out/chip-ota-provider-app bin/
       - name: Rename and strip symbols
         run: |
-          for example in bin/*; do
-              mv "${example}" "${example}-${{ matrix.arch.name }}"
-          done
-          for example in bin/*; do
-              objcopy --only-keep-debug "${example}" "${example}.debug"
-              strip --strip-debug "${example}"
-              objcopy --add-gnu-debuglink="${example}.debug" "${example}"
-          done
+          for example in bin/*; do mv "${example}" "${example}-${{ matrix.arch.name }}"; done
+          for example in bin/*; do objcopy --only-keep-debug "$example" "$example.debug"; strip --strip-debug "$example"; objcopy --add-gnu-debuglink="$example.debug" "$example"; done
       - name: Upload binaries as artifacts
         uses: actions/upload-artifact@v4
         with:
           name: chip-linux-example-apps-${{ matrix.arch.name }}
           path: |
-            ./connectedhomeip/bin/
-            !./connectedhomeip/bin/*.debug
+            bin/*
+            !bin/*.debug
       - name: Upload debug symbols as artifacts
         uses: actions/upload-artifact@v4
         with:
           name: chip-linux-example-apps-debug-${{ matrix.arch.name }}
-          path: |
-            ./connectedhomeip/bin/*.debug
+          path: bin/*.debug
       - name: Upload binaries as release assets
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: ./connectedhomeip/bin/*
+          files: bin/*
