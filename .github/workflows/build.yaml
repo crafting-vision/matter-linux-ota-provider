@@ -1,6 +1,6 @@
 name: Matter Linux OTA Provider build
 
-on: workflow_dispatch
+on: push
 
 jobs:
   build_prepare:
@@ -10,24 +10,53 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       channel: ${{ steps.version.outputs.channel }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout build repository
+        uses: actions/checkout@v4
         with:
           submodules: true
           fetch-depth: 0
       - name: Get version
         id: version
+        shell: bash
         run: |
-          version=${{ github.ref_name }}
-          echo "version=$version" >> $GITHUB_OUTPUT
+          version=$(echo "${{ github.ref }}" | awk -F"/" '{print $NF}')
+          if [[ ! -z "${{ github.event.inputs.version }}" ]]; then
+            version="${{ github.event.inputs.version }}"
+          elif [[ "${version}" =~ (main|dev) ]]; then
+            today="$(date --utc '+%Y-%m-%d')"
+            midnight_timestamp="$(date --utc +%s --date=$today)"
+            calver_date="$(date --utc --date=$today '+%Y.%-m.dev%-d')"
+            commit_count="$(git rev-list --count --since=$midnight_timestamp HEAD)"
+            commit_count="$(printf "%02d" ${commit_count})"
+            version="${calver_date}${commit_count}"
+          elif [[ "${{ github.ref }}" =~ ^refs/heads/ ]]; then
+            today="$(date --utc '+%Y-%m-%d')"
+            midnight_timestamp="$(date --utc +%s --date=$today)"
+            calver_date="$(date --utc --date=$today '+%Y.%-m.dev%-d')"
+            # Remove invalid chars
+            localversion="${version}"
+            localversion="${localversion//-/}"
+            localversion="${localversion//_/}"
+            version="${calver_date}+${localversion}"
+          fi
+          echo "Building version $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Checkout submodules
         working-directory: ./connectedhomeip/
         run: scripts/checkout_submodules.py --shallow --platform linux
       - name: Apply patches
         working-directory: ./connectedhomeip/
         run: |
-          for p in ../*.patch; do
-            [ -e "$p" ] || continue
-            patch -p1 < "$p"
+          patches=(../*.patch)
+          if [ ! -e "${patches[0]}" ]
+          then
+              echo "No patches found"
+              exit 0
+          fi
+          for patch in "${patches[@]}"
+          do
+              echo "Applying ${patch}"
+              patch -p1 < $patch
           done
       - name: Bootstrap
         working-directory: ./connectedhomeip/
@@ -37,67 +66,115 @@ jobs:
         run: scripts/run_in_build_env.sh "scripts/codepregen.py ./zzz_pregenerated/"
       - name: Create Matter SDK tar
         run: |
-          tar -caf ../connectedhomeip.tar.zst \
-            --exclude ./connectedhomeip/.environment \
-            --use-compress-program=zstdmt .
+          tar -caf ../connectedhomeip.tar.zst --exclude ./connectedhomeip/.environment --use-compress-program=zstdmt .
           mv ../connectedhomeip.tar.zst ./connectedhomeip.tar.zst
-      - name: Upload SDK artifact
+      - name: Store Matter SDK as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: matter-sdk
+          name: matter-sdk-${{ github.run_id }}
           path: ./connectedhomeip.tar.zst
 
-  build_armv7:
-    name: Build OTA Provider ARMv7
-    runs-on: ubuntu-22.04
+  build_linux_examples:
+    name: Build example apps for Linux (${{ matrix.arch.name }})
     needs: build_prepare
+
+    strategy:
+      matrix:
+        arch:
+          - name: armv7
+            runner: ubuntu-22.04
+            container: arm32v7/debian:12-slim
+        include:
+          - examples: >-
+              ota-provider
+            variant: -libnl-no-ble-no-wifi-no-thread-boringssl
+
+    runs-on: ${{ matrix.arch.runner }}
+    permissions:
+      contents: write # for actions/upload-release-asset to upload release asset
+
+    defaults:
+      run:
+        working-directory: ./connectedhomeip/
+
     container:
       image: arm32v7/debian:12-slim
+      volumes:
+        - "/tmp/log_output:/tmp/test_logs"
+      options: --sysctl "net.ipv6.conf.all.disable_ipv6=0
+        net.ipv4.conf.all.forwarding=1 net.ipv6.conf.all.forwarding=1"
 
     steps:
-      - name: Download SDK artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: matter-sdk
-      - name: Extract SDK
-        run: |
-          rm -rf connectedhomeip/
-          tar -xaf connectedhomeip.tar.zst --use-compress-program=zstdmt
-      - name: Install build deps & stub cipd
+      - name: Install chip-wheels dependencies
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential ninja-build cmake python3-venv zstd git pkg-config \
-            libssl-dev libjson-c-dev libnl-3-dev libnl-route-3-dev
-          rm -rf /var/lib/apt/lists/*
-          mkdir -p connectedhomeip/.environment/cipd
-          cat > connectedhomeip/.environment/cipd/cipd << 'EOF'
-#!/bin/sh
-exit 0
-EOF
-          chmod +x connectedhomeip/.environment/cipd/cipd
-      - name: Bootstrap for ARMv7
-        working-directory: ./connectedhomeip/
-        run: bash scripts/bootstrap.sh -p all,linux
-      - name: Build example
-        working-directory: ./connectedhomeip/
+            build-essential \
+            ca-certificates \
+            git \
+            pkg-config \
+            ninja-build \
+            python3-venv \
+            libssl-dev libglib2.0-dev \
+            libnl-3-dev libnl-route-3-dev \
+            libcairo2-dev libgirepository1.0-dev \
+            libdbus-1-dev \
+            python3-dev \
+            zstd
+      - name: Restore Matter SDK from artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: matter-sdk-${{ github.run_id }}
+      - name: Extract Matter SDK from tar
+        working-directory: ./
         run: |
-          mkdir -p out
+          apt update && apt install zstd
+          rm -rf connectedhomeip/
+          tar -xaf ./connectedhomeip.tar.zst --use-compress-program=zstdmt .
+          git config --global --add safe.directory "*"
+      - name: Bootstrap
+        run: bash scripts/bootstrap.sh -p all,linux
+      - name: Setup and run build
+        run: |
+          mkdir bin/
           ./scripts/examples/gn_build_example.sh \
-            examples/ota-provider-app/linux/ \
-            out/ \
-            chip_project_config_include_dirs=["//../../../.."] \
-            chip_crypto=boringssl \
-            chip_config_network_layer_ble=false \
-            chip_enable_wifi=false \
-            chip_enable_openthread=false \
-            chip_exchange_node_id_logging=true \
-            chip_mdns=minimal \
-            chip_minmdns_default_policy=libnl \
-            chip_use_data_model_interface=enabled
-          mv out/chip-ota-provider-app bin/
-      - name: Upload binary
+              examples/ota-provider-app/linux/ \
+              out/ \
+              chip_project_config_include_dirs=\[\"//../../../..\"\] \
+              chip_crypto=\"boringssl\" \
+              chip_config_network_layer_ble=false \
+              chip_enable_wifi=false \
+              chip_enable_openthread=false \
+              chip_exchange_node_id_logging=true \
+              chip_mdns=\"minimal\" \
+              chip_minmdns_default_policy=\"libnl\" \
+              chip_use_data_model_interface=\"enabled\"
+          cp out/chip-ota-provider-app bin/
+      - name: Rename and strip symbols
+        run: |
+          for example in bin/*; do
+              mv "${example}" "${example}-${{ matrix.arch.name }}"
+          done
+          for example in bin/*; do
+              objcopy --only-keep-debug "${example}" "${example}.debug"
+              strip --strip-debug "${example}"
+              objcopy --add-gnu-debuglink="${example}.debug" "${example}"
+          done
+      - name: Upload binaries as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ota-provider-armv7
-          path: connectedhomeip/bin/chip-ota-provider-app
+          name: chip-linux-example-apps-${{ matrix.arch.name }}
+          path: |
+            ./connectedhomeip/bin/
+            !./connectedhomeip/bin/*.debug
+      - name: Upload debug symbols as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chip-linux-example-apps-debug-${{ matrix.arch.name }}
+          path: |
+            ./connectedhomeip/bin/*.debug
+      - name: Upload binaries as release assets
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ./connectedhomeip/bin/*
